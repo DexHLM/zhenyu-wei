@@ -58,6 +58,68 @@ const coverScenes = [
 ];
 const coverMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
+// A small optical texture sampled from the already-loaded cover. Only the outer
+// bevel bends pixels; the centre stays clear. No extra image or animation library.
+function makeGlassTexture(image, bounds) {
+  if (!image.complete || !image.naturalWidth || bounds.width < 1) return null;
+  const frame = image.getBoundingClientRect();
+  if (!frame.width || !frame.height) return null;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.round(bounds.width * ratio);
+  const height = Math.round(bounds.height * ratio);
+  const margin = Math.ceil(8 * ratio);
+  const source = document.createElement("canvas");
+  source.width = width + 2 * margin;
+  source.height = height + 2 * margin;
+  const sourceContext = source.getContext("2d", { willReadFrequently: true });
+  const scale = Math.max(frame.width / image.naturalWidth, frame.height / image.naturalHeight);
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  sourceContext.drawImage(image,
+    (frame.left - bounds.left - (drawWidth - frame.width) / 2) * ratio + margin,
+    (frame.top - bounds.top - (drawHeight - frame.height) / 2) * ratio + margin,
+    drawWidth * ratio, drawHeight * ratio);
+  const pixels = sourceContext.getImageData(0, 0, source.width, source.height).data;
+  const texture = document.createElement("canvas");
+  texture.width = width;
+  texture.height = height;
+  const context = texture.getContext("2d");
+  const output = context.createImageData(width, height);
+  const radius = bounds.height / 2;
+  let brightness = 0;
+  let count = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const px = (x + 0.5) / ratio;
+      const py = (y + 0.5) / ratio;
+      const centre = Math.max(radius, Math.min(bounds.width - radius, px));
+      const dx = px - centre;
+      const dy = py - radius;
+      const length = Math.hypot(dx, dy);
+      const depth = radius - length;
+      if (depth < 0) continue;
+      const bend = 3 * Math.pow(Math.max(0, 1 - depth / 6), 2);
+      const sx = Math.max(0, Math.min(source.width - 2, x + margin + (length ? dx / length : 0) * bend * ratio));
+      const sy = Math.max(0, Math.min(source.height - 2, y + margin + (length ? dy / length : 0) * bend * ratio));
+      const ix = Math.floor(sx), iy = Math.floor(sy);
+      const fx = sx - ix, fy = sy - iy;
+      const a = (iy * source.width + ix) * 4;
+      const b = a + source.width * 4;
+      const target = (y * width + x) * 4;
+      for (let channel = 0; channel < 3; channel++) {
+        output.data[target + channel] =
+          pixels[a + channel] * (1 - fx) * (1 - fy) + pixels[a + 4 + channel] * fx * (1 - fy) +
+          pixels[b + channel] * (1 - fx) * fy + pixels[b + 4 + channel] * fx * fy;
+      }
+      output.data[target + 3] = 255;
+      brightness += output.data[target] * 0.2126 + output.data[target + 1] * 0.7152 + output.data[target + 2] * 0.0722;
+      count++;
+    }
+  }
+  context.putImageData(output, 0, 0);
+  return { texture, lightBackground: brightness / count > 145 };
+}
+
 for (const carousel of document.querySelectorAll(".cover-carousel")) {
   const link = carousel.querySelector(".cover-link");
   const first = link.querySelector("img");
@@ -75,6 +137,45 @@ for (const carousel of document.querySelectorAll(".cover-carousel")) {
   let hovered = false;
   let focused = false;
   let timer;
+  const lens = document.createElement("canvas");
+  lens.className = "cover-glass-lens";
+  lens.setAttribute("aria-hidden", "true");
+  controls.prepend(lens);
+  let lensAnimation;
+
+  function refreshGlass(previousImage) {
+    window.cancelAnimationFrame(lensAnimation);
+    const bounds = controls.getBoundingClientRect();
+    let next, previous;
+    try {
+      next = makeGlassTexture(frames[active], bounds);
+      if (!next) return;
+      if (previousImage && !coverMotion.matches) previous = makeGlassTexture(previousImage, bounds);
+    } catch {
+      // The translucent CSS surface remains usable if canvas sampling is unavailable.
+      controls.classList.remove("has-lens");
+      return;
+    }
+    controls.classList.add("has-lens");
+    controls.dataset.contrast = next.lightBackground ? "dark" : "light";
+    lens.width = next.texture.width;
+    lens.height = next.texture.height;
+    const context = lens.getContext("2d");
+    const started = performance.now();
+    function paint(now) {
+      const progress = previous ? Math.min(1, (now - started) / 450) : 1;
+      context.clearRect(0, 0, lens.width, lens.height);
+      if (previous) context.drawImage(previous.texture, 0, 0);
+      context.globalAlpha = 1 - Math.pow(1 - progress, 3);
+      context.drawImage(next.texture, 0, 0);
+      context.globalAlpha = 1;
+      if (progress < 1) lensAnimation = window.requestAnimationFrame(paint);
+    }
+    paint(started);
+  }
+
+  first.addEventListener("load", () => refreshGlass(), { once: true });
+  if ("ResizeObserver" in window) new ResizeObserver(() => refreshGlass()).observe(controls);
 
   function schedule() {
     window.clearTimeout(timer);
@@ -132,6 +233,7 @@ for (const carousel of document.querySelectorAll(".cover-carousel")) {
       // A slow download must never override a more recent selection.
       if (currentRevision !== revision) return;
       if (index !== active) {
+        const previousImage = frames[active];
         frames.forEach((frame, i) => {
           if (!frame) return;
           frame.classList.toggle("is-previous", i === active);
@@ -139,6 +241,7 @@ for (const carousel of document.querySelectorAll(".cover-carousel")) {
           frame.setAttribute("aria-hidden", String(i !== index));
         });
         active = index;
+        refreshGlass(previousImage);
         controls.style.setProperty("--active-slide", String(active));
         dots.forEach((dot, i) => dot.setAttribute("aria-pressed", String(i === active)));
       }
@@ -188,6 +291,7 @@ for (const carousel of document.querySelectorAll(".cover-carousel")) {
   if ("IntersectionObserver" in window) {
     const observer = new IntersectionObserver(([entry]) => {
       visible = entry.isIntersecting;
+      if (visible) refreshGlass();
       schedule();
     }, { threshold: 0.1 });
     observer.observe(carousel);
@@ -195,6 +299,7 @@ for (const carousel of document.querySelectorAll(".cover-carousel")) {
     visible = true;
   }
   setPaused(paused);
+  refreshGlass();
 }
 
 const newsToggle = document.querySelector("#news-more");
